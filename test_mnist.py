@@ -3,7 +3,7 @@ os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 import tensorflow as tf
 import keras
 import numpy
-from sklearn.cluster import KMeans, DBSCAN
+from sklearn.cluster import KMeans, DBSCAN, SpectralClustering
 from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score, adjusted_mutual_info_score
 import sys
 import time
@@ -86,182 +86,136 @@ options = numpy.array([
 	[10,20,50]
 ])
 
-if True:
-#	features_train = x_train.reshape(len(x_train),-1)
-#	norm = features_train.sum(axis=1)
-#	features_train /= norm.reshape(-1,1)
-#
-#	kmeans_label = KMeans(n_clusters=10, random_state=0).fit_predict(features_train)
-#	nmi = normalized_mutual_info_score(y_train, kmeans_label)
-#	ami = adjusted_mutual_info_score(y_train, kmeans_label)
-#	ars = adjusted_rand_score(y_train, kmeans_label)
-#	print("NMI: %.3f AMI: %.3f ARS: %.3f %d/%d clusters"% (nmi,ami,ars,len(numpy.unique(kmeans_label)),len(numpy.unique(y_train))))
+features_train = x_train.reshape(len(x_train),-1)
+norm = features_train.sum(axis=1)
+features_train /= norm.reshape(-1,1)
 
-	config = tf.ConfigProto()
-	config.gpu_options.allow_growth = True
-	config.allow_soft_placement = True
-	config.log_device_placement = False
-	N = 100 #number of learners
-	L = 600 #images per episode
-	cycles = len(x_train) / L
-	repeat_episodes = 10
-	M = int(L * 0.05) #batch size of learner
-	nets = [None] * N
-	genes = [None] * N
-	tf.set_random_seed(0)
-	numpy.random.seed(0)
+kmeans_label = KMeans(n_clusters=10, random_state=0).fit_predict(features_train)
+nmi = normalized_mutual_info_score(y_train, kmeans_label)
+ami = adjusted_mutual_info_score(y_train, kmeans_label)
+ars = adjusted_rand_score(y_train, kmeans_label)
+print("KMeans NMI: %.3f AMI: %.3f ARS: %.3f %d/%d clusters"% (nmi,ami,ars,len(numpy.unique(kmeans_label)),len(numpy.unique(y_train))))
+spectral_label = SpectralClustering(n_clusters=10, random_state=0).fit_predict(features_train)
+nmi = normalized_mutual_info_score(y_train, spectral_label)
+ami = adjusted_mutual_info_score(y_train, spectral_label)
+ars = adjusted_rand_score(y_train, spectral_label)
+print("Spectral NMI: %.3f AMI: %.3f ARS: %.3f %d/%d clusters"% (nmi,ami,ars,len(numpy.unique(spectral_label)),len(numpy.unique(y_train))))
 
-	#initialize network weights
+config = tf.ConfigProto()
+config.gpu_options.allow_growth = True
+config.allow_soft_placement = True
+config.log_device_placement = False
+N = 100 #number of learners
+L = 600 #images per episode
+cycles = len(x_train) / L
+repeat_episodes = 10
+M = int(L * 0.1) #batch size of learner
+K = 10 #number of neighbors
+nets = [None] * N
+genes = [None] * N
+tf.set_random_seed(0)
+numpy.random.seed(0)
+
+#initialize network weights
+t = time.time()
+for i in range(N):
+	gene = options[range(options.shape[0]), numpy.random.randint(0,options.shape[1],options.shape[0])]
+	gene = list(gene)[:5] + [2]
+	net = MyNet(M,x_train.shape[-1],gene,i) 
+	nets[i] = net
+	genes[i] = gene
+	sys.stdout.write('creating %d/%d nets\r'%(i+1,N))
+	sys.stdout.flush()
+sess = tf.Session(config=config)
+init = tf.global_variables_initializer()
+sess.run(init)
+print("Network initialization: %.2fs"%(time.time() - t))
+
+for e in range(10):
+	episode = e / repeat_episodes
+	train_images = x_train[(episode%cycles)*L:((episode%cycles)+1)*L, :, :]
+	picks = []
+	unpicks = []
+	mode = []
+	inlier_acc = []
+	intersect_ratio = []
+	intersect_acc = []
+	losses = []
 	t = time.time()
 	for i in range(N):
-		gene = options[range(options.shape[0]), numpy.random.randint(0,options.shape[1],options.shape[0])]
-		gene = list(gene)[:5] + [2]
-#		gene = [5,10,5,20,100,2]
-		net = MyNet(M,x_train.shape[-1],gene,i) 
-		nets[i] = net
-		genes[i] = gene
-		sys.stdout.write('creating %d/%d nets\r'%(i+1,N))
-		sys.stdout.flush()
-	sess = tf.Session(config=config)
-	init = tf.global_variables_initializer()
-	sess.run(init)
-	print("Network initialization: %.2fs"%(time.time() - t))
+		probs = []
+		for j in range(len(train_images) / M):
+			start_idx = j * M
+			end_idx = (j+1) * M
+			p = sess.run(nets[i].probs, feed_dict={nets[i].images_pl:train_images[start_idx:end_idx]})[:,1]
+			probs.extend(p)
+		order = numpy.argsort(probs)
+		top = order[-M:]
+		bottom = order[:M]
+		picks.append(set(top))
+		unpicks.append(set(bottom))
+		top_labels = y_train[top]
+		i,c = numpy.unique(top_labels,return_counts=True)
+		mode.append(i[numpy.argmax(c)])
+		inliers1 = 1.0 * numpy.max(c) / M
+		inlier_acc.append(inliers1)
+	print("Inlier computation: %.2fs"%(time.time() - t))
 
-	for e in range(30):
-		episode = e / repeat_episodes
-		train_images = x_train[(episode%cycles)*L:((episode%cycles)+1)*L, :, :]
-		picks = []
-		mode = []
-		inlier_acc = []
-		intersect_ratio = []
-		intersect_acc = []
-		losses = []
-		t = time.time()
-		for i in range(N):
-			probs = []
-			for j in range(len(train_images) / M):
-				start_idx = j * M
-				end_idx = (j+1) * M
-				p = sess.run(nets[i].probs, feed_dict={nets[i].images_pl:train_images[start_idx:end_idx]})[:,1]
-				probs.extend(p)
-			order = numpy.argsort(probs)
-			top = order[-M:]
-			bottom = order[:M]
-			picks.append(set(top))
-			picks.append(set(bottom))
-			top_labels = y_train[top]
-			i,c = numpy.unique(top_labels,return_counts=True)
-			mode.append(i[numpy.argmax(c)])
-			inliers1 = 1.0 * numpy.max(c) / M
-			bottom_labels = y_train[bottom]
-			i,c = numpy.unique(bottom_labels,return_counts=True)
-			mode.append(i[numpy.argmax(c)])
-			inliers2 = 1.0 * numpy.max(c) / M
-			inlier_acc.append(max(inliers1, inliers2))
-#			print(list(top_labels) + list(bottom_labels))
-#		print("Inlier computation: %.2fs"%(time.time() - t))
+	pairwise_score = numpy.zeros((N, N))
+	for i in range(N):
+		for j in range(N):
+			if i != j:
+				score = len(picks[i].intersection(picks[j]))
+				pairwise_score[i][j] = score
+				pairwise_score[j][i] = score
+	
+	for i in range(N):
+		scores = pairwise_score[i,:]
+		c = numpy.argsort(scores)[::-1][:K]
+		intersect_ratio.extend(scores[c] / M)
+		positives = reduce(lambda x,y: x+y, [list(picks[j]) for j in c])
+		negatives = reduce(lambda x,y: x+y, [list(unpicks[j]) for j in c])
+		k,c = numpy.unique(y_train[positives], return_counts=True)
+		m = k[numpy.argmax(c)]
+		pr = 1.0 * numpy.sum(y_train[positives]==m) / len(positives)
+		nr = 1.0 * numpy.sum(y_train[negatives]!=m) / len(negatives)
+		intersect_acc.append(pr)
+		intersect_acc.append(nr)
 
-		G = nx.Graph()
-		validated = set()
-		for p in picks:
-			edges = list(itertools.combinations(sorted(list(p)), 2))
-			for e in validated.intersection(edges):
-				if e in G.edges:
-					w = G.edges[e]['weight']
-					G.add_edge(e[0],e[1],weight=w+1)
-				else:
-					G.add_edge(e[0],e[1],weight=1)
-			validated.update(edges)
-		print('Created graph with %d nodes %d/%d edges'%(len(G.nodes), len(G.edges), len(validated)))
-		weights = [d['weight'] for (u,v,d) in G.edges.data()]
-		print('Weights %d %.2f %d'%(numpy.min(weights),numpy.mean(weights),numpy.max(weights)))
-		nx.draw(G, node_color=y_train[list(G.nodes)], labels={i:y_train[i] for i in G.nodes}, width=weights)
-		plt.show()
-		sys.exit(1)
-
-		t = time.time()
-		for i in range(N):
-			best_pair = (None,None,None,None)
-			max_intersect = 0
-			for j in range(2*N):
-				if 2*i!=j:
-					num_intersect = len(picks[2*i].intersection(picks[j]))
-					if num_intersect > max_intersect:
-						max_intersect = num_intersect
-						best_pair = (i,j/2,0,j%2)
-				if 2*i+1!=j:
-					num_intersect = len(picks[2*i+1].intersection(picks[j]))
-					if num_intersect > max_intersect:
-						max_intersect = num_intersect
-						best_pair = (i,j/2,1,j%2)
-			intersect_ratio.append(1.0 * max_intersect / M)
-			intersect_acc.append(mode[2*best_pair[0]+best_pair[2]] == mode[2*best_pair[1]+best_pair[3]])
-			print('%d/%d intersects (%d<->%d) %s%s'%(max_intersect,M, mode[2*best_pair[0]+best_pair[2]], mode[2*best_pair[1]+best_pair[3]], '-' if best_pair[2] else '+', '-' if best_pair[3] else '+'))
-
-			train_idx = list(picks[2*i + best_pair[2]])
-			lb = [k in picks[2*best_pair[1] + best_pair[3]] for k in train_idx]
-			if best_pair[2]: #flip sign if bottom inliers
-				lb = numpy.logical_not(lb)
-			loss,_ = sess.run([nets[i].loss,nets[i].train_op], feed_dict={nets[i].images_pl:train_images[train_idx], nets[i].labels_pl:lb})
+		train_labels = numpy.array([1] * len(positives) + [0] * len(negatives))
+		train_idx = numpy.array(positives + negatives)
+		shuffled_idx = numpy.arange(len(train_labels))
+		numpy.random.shuffle(shuffled_idx)
+		num_batches = len(train_labels) / M
+		for j in range(num_batches):
+			loss,_ = sess.run([nets[i].loss,nets[i].train_op], feed_dict={
+				nets[i].images_pl: train_images[train_idx[shuffled_idx[j*M:(j+1)*M]]],
+				nets[i].labels_pl: train_labels[shuffled_idx[j*M:(j+1)*M]]
+			})
 			losses.append(loss)
-#		print("Network training: %.2fs"%(time.time() - t))
-		print('Episode %d: loss: %.2f inlier: %.2f intersect %.2f %.2f'%(episode,numpy.mean(losses),numpy.mean(inlier_acc), numpy.mean(intersect_ratio), numpy.mean(intersect_acc)))
 
-	sys.exit(1)
+	print('Episode %d: loss: %.2f inlier: %.2f intersect %.2f %.2f'%(episode,numpy.mean(losses),numpy.mean(inlier_acc),numpy.mean(intersect_ratio),numpy.mean(intersect_acc)))
 
-BATCH_SIZE = 100
-VAL_STEP = 50
-MAX_EPOCH = 50
+affinity = numpy.zeros((len(train_images), len(train_images)))
+for i in range(N):
+	probs = []
+	for j in range(len(train_images) / M):
+		start_idx = j * M
+		end_idx = (j+1) * M
+		p = sess.run(nets[i].probs, feed_dict={nets[i].images_pl:train_images[start_idx:end_idx]})[:,1]
+		probs.extend(p)
+#	order = numpy.argsort(probs)
+#	top = order[-M:]
+	top = numpy.nonzero(numpy.array(probs) > 0.5)[0]
+	for u,v in itertools.combinations(sorted(top),2):
+		affinity[u,v] += 1
+		affinity[v,u] += 1
 
-with tf.Graph().as_default():
-	with tf.device('/gpu:0'):
-		gene = options[range(options.shape[0]), numpy.random.randint(0,options.shape[1],options.shape[0])]
-#		gene = [5,10,5,20,100,10]
-		print(gene)
-		net = MyNet(BATCH_SIZE,x_train.shape[-1],list(gene)[:-1] + [y_train.max()+1]) 
-		saver = tf.train.Saver()
-		config = tf.ConfigProto()
-		config.gpu_options.allow_growth = True
-		config.allow_soft_placement = True
-		config.log_device_placement = False
-		sess = tf.Session(config=config)
-		init = tf.global_variables_initializer()
-		sess.run(init)
+#plt.imshow(affinity)
+#plt.show()
 
-		for epoch in range(MAX_EPOCH):
-			#shuffle data
-			idx = numpy.arange(len(y_train))
-			numpy.random.shuffle(idx)
-			shuffled_images = x_train[idx, :, :]
-			shuffled_labels = y_train[idx]
-
-			#split into batches
-			num_batches = int(len(y_train) / BATCH_SIZE)
-			losses = []
-			accuracies = []
-			for batch_id in range(num_batches):
-				start_idx = batch_id * BATCH_SIZE
-				end_idx = (batch_id + 1) * BATCH_SIZE
-				feed_dict = {net.images_pl: shuffled_images[start_idx:end_idx,:,:],
-					net.labels_pl: shuffled_labels[start_idx:end_idx]}
-				loss,accuracy,_ = sess.run([net.loss,net.accuracy,net.train_op],feed_dict=feed_dict)
-				losses.append(loss)
-				accuracies.append(accuracy)
-#			print('Epoch: %d Loss: %.3f Accuracy: %.3f'%(epoch, numpy.mean(losses),numpy.mean(accuracies)))
-
-			if epoch % VAL_STEP == VAL_STEP - 1:
-				#get validation loss
-				num_batches = int(len(y_test) / BATCH_SIZE)
-				losses = []
-				accuracies = []
-				for batch_id in range(num_batches):
-					start_idx = batch_id * BATCH_SIZE
-					end_idx = (batch_id + 1) * BATCH_SIZE
-					feed_dict = {net.images_pl: x_test[start_idx:end_idx,:,:],
-						net.labels_pl: y_test[start_idx:end_idx]}
-					loss,accuracy = sess.run([net.loss,net.accuracy], feed_dict=feed_dict)
-					losses.append(loss)
-					accuracies.append(accuracy)
-				print('Validation: %d Loss: %.3f Accuracy: %.3f'%(epoch,numpy.mean(losses),numpy.mean(accuracies)))
-
-#		saver.save(sess, MODEL_PATH)
+spectral_label = SpectralClustering(n_clusters=10, random_state=0, affinity='precomputed').fit_predict(affinity)
+nmi = normalized_mutual_info_score(y_train, spectral_label)
+ami = adjusted_mutual_info_score(y_train, spectral_label)
+ars = adjusted_rand_score(y_train, spectral_label)
+print("Spectral NMI: %.3f AMI: %.3f ARS: %.3f %d/%d clusters"% (nmi,ami,ars,len(numpy.unique(spectral_label)),len(numpy.unique(y_train))))
